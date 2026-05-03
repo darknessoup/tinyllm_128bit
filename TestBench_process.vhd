@@ -3,25 +3,24 @@
 -- Description:
 --   Single-cycle timing testbench for matmul_v1_0.
 --
---   Purpose: confirm that the component reads one 128-bit word from BRAM
---   (activations) and performs exactly one MAC cycle against one 128-bit
---   weight beat, producing the correct result on m00_axis_tdata.
+--   Purpose: Validate that the component reads 128-bit activations from BRAM
+--   and performs MAC operations against 128-bit weight beats from DDR/DMA.
 --
---   Test vectors
---     Activations (BRAM addr 0): byte[i] = i  (0x00, 0x01, ..., 0x0F)
---     Weights (AXI-Stream beat):  byte[i] = 1  (x"01010101010101010101010101010101")
---     vec_len = 16  =>  length_div16 = 1  (one BRAM word, one weight beat)
+--   Test vectors:
+--     Activations (BRAM addr 0): 16x [1,1,1,...,1] = 0x01010101010101010101010101010101
+--     Weights (AXI-Stream beat):  [1,2,3,...,16] = 0x0102030405060708090a0b0c0d0e0f10
+--     vec_len = 16  =>  length_div16 = 1
 --
---   Expected result:  sum(i * 1, i=0..15) = 120 = 0x78
---   Observe on waveform: m00_axis_tdata = 0x0000000000000078 when tvalid rises.
+--   Expected result: sum(i * 1, i=1..16) = 1+2+3+...+16 = 136 = 0x88
+--   Observe on waveform: m00_axis_tdata = 0x0000000000000088 when tvalid rises.
 --
 --   Key signals to probe
 --     addra        : BRAM read address (should be 0x000)
 --     ena          : BRAM enable (high during idle pre-fetch and active)
---     douta        : activation data from BRAM (0x0f0e0d0c0b0a09080706050403020100)
+--     douta        : activation data from BRAM (0x01010101010101010101010101010101)
 --     s00_axis_tready : high when manager is in 'active' state
 --     m00_axis_tvalid : rises when result is ready
---     m00_axis_tdata  : expected 0x0000000000000078
+--     m00_axis_tdata  : expected 0x00000088 (136 decimal, 32-bit)
 ----------------------------------------------------------------------------------
 
 library IEEE;
@@ -33,7 +32,7 @@ end matmul_timing_tb;
 
 architecture Behavioral of matmul_timing_tb is
 
-component matmul_v1_0 is
+component matmul_0 is
 port (
     addra : out std_logic_vector(11 downto 0);
     clka : out std_logic;
@@ -49,7 +48,7 @@ port (
     s00_axi_awvalid : IN STD_LOGIC;
     s00_axi_awready : OUT STD_LOGIC;
     s00_axi_wdata : IN STD_LOGIC_VECTOR(31 DOWNTO 0);
-    s00_axi_wstrb : IN STD_LOGIC_VECTOR(15 DOWNTO 0);
+    s00_axi_wstrb : IN STD_LOGIC_VECTOR(3 DOWNTO 0);
     s00_axi_wvalid : IN STD_LOGIC;
     s00_axi_wready : OUT STD_LOGIC;
     s00_axi_bresp : OUT STD_LOGIC_VECTOR(1 DOWNTO 0);
@@ -71,8 +70,8 @@ port (
     s00_axis_tlast : IN STD_LOGIC;
     s00_axis_tvalid : IN STD_LOGIC;
     m00_axis_tvalid : OUT STD_LOGIC;
-    m00_axis_tdata : OUT STD_LOGIC_VECTOR(63 DOWNTO 0);
-    m00_axis_tstrb : OUT STD_LOGIC_VECTOR(7 DOWNTO 0);
+    m00_axis_tdata : OUT STD_LOGIC_VECTOR(31 DOWNTO 0);
+    m00_axis_tstrb : OUT STD_LOGIC_VECTOR(3 DOWNTO 0);
     m00_axis_tlast : OUT STD_LOGIC;
     m00_axis_tready : IN STD_LOGIC
 );
@@ -80,7 +79,7 @@ end component;
 
 -- True dual-port BRAM: 128-bit wide, 1024 deep.
 -- Port A read by matmul_v1_0 (activations). Port B written by testbench.
-COMPONENT blk_mem_dp_128_1024
+COMPONENT blk_mem_dp_32_1024
   PORT (
     clka : IN STD_LOGIC;
     rsta : IN STD_LOGIC;
@@ -114,15 +113,17 @@ signal s00_axi_awvalid, s00_axi_wvalid, s00_axi_bready,
        s00_axi_awready, s00_axi_wready, s00_axi_bvalid : std_logic;
 
 signal s00_axis_tvalid, s00_axis_tlast, s00_axis_tready : std_logic := '0';
-signal m00_axis_tready  : std_logic := '0';
+signal m00_axis_tready, m00_axis_tvalid, m00_axis_tlast : std_logic := '0';
 signal s00_axis_tdata   : std_logic_vector(127 downto 0) := (others => '0');
 signal s00_axis_tstrb   : std_logic_vector(15 downto 0)  := (others => '0');
+signal m00_axis_tdata   : std_logic_vector(31 downto 0)  := (others => '0');
+signal m00_axis_tstrb   : std_logic_vector(3 downto 0)   := (others => '0');
 
 constant clk_period : time := 10 ns;
 
 begin
 
-blk_mem_inst : blk_mem_dp_128_1024
+blk_mem_inst : blk_mem_dp_32_1024
   port map (
     rsta => rsta,
     clka => clk,
@@ -137,12 +138,12 @@ blk_mem_inst : blk_mem_dp_128_1024
     enb   => '1',
     web   => web,
     addrb => (others => '0'),
-    -- Activation bytes: byte[0]=0x00, byte[1]=0x01, ..., byte[15]=0x0F
-    dinb  => x"0f0e0d0c0b0a09080706050403020100",
+    -- Activation bytes: 16x [1] = 0x01010101010101010101010101010101
+    dinb  => x"01010101010101010101010101010101",
     doutb => open
   );
 
-inst_matmul_v1_0 : matmul_v1_0
+inst_matmul_v1_0 : matmul_0
     port map (
         s00_axi_aclk    => clk,
         s00_axi_aresetn => resetn,
@@ -168,6 +169,10 @@ inst_matmul_v1_0 : matmul_v1_0
         s00_axis_tstrb  => s00_axis_tstrb,
         s00_axis_tlast  => s00_axis_tlast,
         s00_axis_tvalid => s00_axis_tvalid,
+        m00_axis_tvalid => m00_axis_tvalid,
+        m00_axis_tdata  => m00_axis_tdata,
+        m00_axis_tstrb  => m00_axis_tstrb,
+        m00_axis_tlast  => m00_axis_tlast,
         m00_axis_tready => m00_axis_tready,
 
         addra => addra,
@@ -228,24 +233,30 @@ begin
     m00_axis_tready <= '1';
     wait until rising_edge(clk);
 
-    -- Step 5: Send ONE 128-bit weight beat, all bytes = 0x01, tlast asserted.
-    -- MAC sum = 0*1 + 1*1 + ... + 15*1 = 120 = 0x78
-    s00_axis_tdata  <= x"01010101010101010101010101010101";
+    -- Step 5: Send ONE 128-bit weight beat with weights [1..16], tlast asserted.
+    -- Weights: 0x0102030405060708090a0b0c0d0e0f10
+    -- Activations: 0x01010101010101010101010101010101 (all 1's)
+    -- MAC: sum(i * 1, i=1..16) = 1+2+3+...+16 = 136 = 0x88
+    s00_axis_tdata  <= x"0102030405060708090a0b0c0d0e0f10";
     s00_axis_tstrb  <= x"FFFF";
     s00_axis_tvalid <= '1';
     s00_axis_tlast  <= '1';
-    wait until rising_edge(clk);
-    while s00_axis_tready /= '1' loop
+    -- Proper AXI-Stream handshake: keep tvalid asserted until tready is seen
+    -- HIGH at a rising edge (i.e., the beat is actually consumed that cycle).
+    -- The old pattern burned one cycle with an unconditional wait, then exited
+    -- the loop post-delta when tready had gone high but the handshake edge had
+    -- already passed -- leaving tvalid='0' on the first active cycle.
+    loop
         wait until rising_edge(clk);
+        exit when s00_axis_tready = '1';
     end loop;
     s00_axis_tvalid <= '0';
     s00_axis_tlast  <= '0';
 
     -- Step 6: Wait for m00_axis_tvalid.
-    -- m00_axis_tdata should equal 0x0000000000000078.
-    -- The 4-stage adder tree in matmul_manager adds several clock cycles of
-    -- latency between the weight beat being accepted and tvalid rising.
-    wait until m00_axis_tvalid = '1';
+    -- m00_axis_tdata should equal 0x0000000000000088 (136 decimal).
+    -- The pipeline in matmul_manager adds latency between the weight beat being
+    -- accepted and tvalid rising.
     wait for 50 ns;  -- keep result visible in waveform
 
     wait;

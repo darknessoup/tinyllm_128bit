@@ -38,7 +38,7 @@ entity macc_dsp is
     clr_acc: in std_logic;
     a: in signed(7 downto 0);
     b: in signed(7 downto 0);
-    accum_out: out signed(63 downto 0)
+    accum_out: out signed(31 downto 0)
   );
 end macc_dsp;
 
@@ -59,7 +59,7 @@ attribute use_dsp of Behavioral : architecture is "yes";
 signal a_reg, b_reg           : signed (7 downto 0) := x"00";
 signal sload_reg              : std_logic := '0';
 signal mult_reg                 : signed (15 downto 0) := x"0000";
-signal adder_out, old_result  : signed (63 downto 0) := x"0000000000000000";
+signal adder_out, old_result  : signed (31 downto 0) := x"00000000";
 begin
 -- Insert the below after begin keyword in architecture
 
