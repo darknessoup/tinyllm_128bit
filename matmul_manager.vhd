@@ -36,7 +36,7 @@ entity matmul_manager is
 	   -- 32 weight input for both DMAs
 		WEIGHT_TDATA_WIDTH	: integer	:= 128;
 		OUTPUT_TDATA_WIDTH	: integer	:= 64;
-		BRAM_ADDR_WIDTH	: integer	:= 12
+		BRAM_ADDR_WIDTH	: integer	:= 11
 	);
   Port (
     length: in unsigned(15 downto 0);
@@ -87,7 +87,7 @@ signal acc_out1, acc_out2, acc_out3, acc_out4, acc_out5, acc_out6, acc_out7, acc
 signal acc_out9, acc_out10, acc_out11, acc_out12, acc_out13, acc_out14, acc_out15, acc_out16: signed(63 downto 0) := (others => '0');
 signal output_reg: std_logic_vector(OUTPUT_TDATA_WIDTH-1 downto 0) := (others => '0');
 signal count, next_count: unsigned(7 downto 0) := to_unsigned(0, 8);
-signal length_div16: unsigned(15 downto 0);
+signal length_div16: unsigned(15 downto 0) := "0000" & length(15 downto 4);
 --signal bram_8bit : std_logic_vector(7 downto 0) := x"00";
 
 --signal fake_bram: unsigned(15 downto 0) := to_unsigned(0, 16);
@@ -100,9 +100,6 @@ begin
 --            bram_din(15 downto 8) when count(1 downto 0) = "01" else
 --           bram_din(23 downto 16) when count(1 downto 0) = "10" else
 --          bram_din(31 downto 24);
-
--- Combinatorial assignment for length divided by 16
-length_div16 <= "0000" & length(15 downto 4);
 
 macc1: macc_dsp port map(
   clk => s00_axis_aclk,
@@ -242,7 +239,7 @@ m00_axis_tdata <= output_reg;
 m00_axis_tlast <= '1' when state = done else '0';
 next_count <= (others => '0') when (state = idle or state = done or count = length_div16-1) else count + 1;
 bram_en <= '1' when (state = idle or s00_axis_tvalid = '1') else '0';
-bram_addr <= std_logic_vector("00" & next_count(7 downto 0) & "00");
+bram_addr <= std_logic_vector(resize(next_count, BRAM_ADDR_WIDTH));
 
 process (s00_axis_aclk)
 begin
@@ -267,7 +264,7 @@ begin
               state <= finishing;
             end if;
             
-            if count = length_div16 - 1 then
+            if resize(count, 16) = length_div16 - 1 then
               first_done <= '1';
             end if; 
             

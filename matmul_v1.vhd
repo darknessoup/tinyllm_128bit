@@ -6,7 +6,7 @@ entity matmul_v1_0 is
 	generic (
 		-- Users to add parameters here
 --        BRAM_DATA_WIDTH	: integer	:= 8;
-    BRAM_ADDR_WIDTH	: integer	:= 12;
+    BRAM_ADDR_WIDTH	: integer	:= 11;
 		-- User parameters ends
 		-- Do not modify the parameters beyond this line
 
@@ -116,7 +116,7 @@ architecture arch_imp of matmul_v1_0 is
     generic (
       WEIGHT_TDATA_WIDTH	: integer	:= 128;
       OUTPUT_TDATA_WIDTH	: integer	:= 64;
-      BRAM_ADDR_WIDTH	: integer	:= 12
+      BRAM_ADDR_WIDTH	: integer	:= 11
     );
     Port (
       length: in unsigned(15 downto 0);
@@ -186,7 +186,8 @@ axilite : matmul_v1_0_S00_AXI
 matmul_inst : matmul_manager
   generic map (
     WEIGHT_TDATA_WIDTH => WEIGHT_TDATA_WIDTH,
-    OUTPUT_TDATA_WIDTH => OUTPUT_TDATA_WIDTH
+    OUTPUT_TDATA_WIDTH => OUTPUT_TDATA_WIDTH,
+    BRAM_ADDR_WIDTH => BRAM_ADDR_WIDTH
   )
   port map (
     length => vec_len,
