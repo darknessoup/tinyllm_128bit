@@ -242,7 +242,7 @@ m00_axis_tdata <= output_reg;
 m00_axis_tlast <= '1' when state = done else '0';
 next_count <= (others => '0') when (state = idle or state = done or count = length_div16-1) else count + 1;
 bram_en <= '1' when (state = idle or s00_axis_tvalid = '1') else '0';
-bram_addr <= std_logic_vector("00" & next_count(7 downto 0) & "00");
+bram_addr <= std_logic_vector(resize(next_count, BRAM_ADDR_WIDTH));
 
 process (s00_axis_aclk)
 begin

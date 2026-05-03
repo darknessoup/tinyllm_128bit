@@ -57,7 +57,7 @@ port (
     s00_axi_awvalid : IN STD_LOGIC;
     s00_axi_awready : OUT STD_LOGIC;
     s00_axi_wdata : IN STD_LOGIC_VECTOR(31 DOWNTO 0);   -- AXI4-Lite is 32-bit (vec_len register)
-    s00_axi_wstrb : IN STD_LOGIC_VECTOR(15 DOWNTO 0);   -- NOTE: should be 3 downto 0 for 32-bit AXI-Lite
+    s00_axi_wstrb : IN STD_LOGIC_VECTOR(3 DOWNTO 0);    -- 4 byte-enables for 32-bit AXI-Lite
     s00_axi_wvalid : IN STD_LOGIC;
     s00_axi_wready : OUT STD_LOGIC;
     s00_axi_bresp : OUT STD_LOGIC_VECTOR(1 DOWNTO 0);

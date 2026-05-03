@@ -24,7 +24,7 @@ class StreamMatmulDriver(DefaultHierarchy):
     def __init__(self, description):
         super().__init__(description)
     
-    def matmul(self, vec_buf, mat_buf, out_buf, timer=None, wait=False): 
+    def matmul(self, vec_buf, mat_buf, out_buf, timer=None): 
         # mat_buf is of size (output_dim, input_dim)
         cdma_cm = timer.child("CDMA") if timer is not None else nullcontext()
         dma_cm = timer.child("DMA") if timer is not None else nullcontext()
@@ -40,11 +40,14 @@ class StreamMatmulDriver(DefaultHierarchy):
                 self.axi_cdma_0.transfer(vec_buf, 0xC000_0000)
 
             with dma_cm:
-                self.axi_dma.sendchannel.transfer(mat_buf)
-        #       No need to wait for sending stream, only receiving
+                # Arm the receive channel BEFORE sending so backpressure
+                # never stalls the pipeline and the channel is always ready
+                # when the first result word arrives.
                 self.axi_dma.recvchannel.transfer(out_buf)
-                if wait:
-                    self.axi_dma.recvchannel.wait()
+                self.axi_dma.sendchannel.transfer(mat_buf)
+                # Always wait: without this the channel stays non-idle on
+                # the next call, raising "DMA channel not idle".
+                self.axi_dma.recvchannel.wait()
 
         return out_buf
         
