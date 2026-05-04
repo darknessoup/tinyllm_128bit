@@ -31,7 +31,11 @@ class StreamMatmulDriver(DefaultHierarchy):
         cm = timer.child("Matmul Inner") if timer is not None else nullcontext()
         with cm:
             size = vec_buf.shape[-1]
-            depth = mat_buf.shape[0]
+            depth = mat_buf.shape[-2]
+#             print(mat_buf.shape[0])
+#             print(vec_buf.shape)
+#             print(out_buf.shape)
+#             print(size)
             assert size == mat_buf.shape[-1], f"Invalid matrix dimensions {size} vs {mat_buf.shape[-1]}"
             assert depth == out_buf.shape[-1], f"Output buffer incorrect size {depth} vs {out_buf.shape[-1]}"
             self.matmul_0.vec_len = size
@@ -40,13 +44,9 @@ class StreamMatmulDriver(DefaultHierarchy):
                 self.axi_cdma_0.transfer(vec_buf, 0xC000_0000)
 
             with dma_cm:
-                # Arm the receive channel BEFORE sending so backpressure
-                # never stalls the pipeline and the channel is always ready
-                # when the first result word arrives.
-                self.axi_dma.recvchannel.transfer(out_buf)
                 self.axi_dma.sendchannel.transfer(mat_buf)
-                # Always wait: without this the channel stays non-idle on
-                # the next call, raising "DMA channel not idle".
+        #       No need to wait for sending stream, only receiving
+                self.axi_dma.recvchannel.transfer(out_buf)
                 self.axi_dma.recvchannel.wait()
 
         return out_buf

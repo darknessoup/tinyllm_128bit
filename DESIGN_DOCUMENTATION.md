@@ -77,70 +77,50 @@ This project implements a 16-parallel MAC (Multiply-Accumulate) engine for matri
 
 ### 2. matmul_manager (Accumulation & Control Engine)
 
-**File:** `matmul_manager.vhd`
-
 **Purpose:** 
 - State machine coordinating BRAM reads and weight stream handshaking
 - Instantiates 16 parallel MAC DSP units
-- Implements 4-stage pipelined summation tree for combining results
-- Produces 64-bit output (neuron accumulator result) at word rate
+- Fires results per row using count-based trigger (every `length_div16` beats)
+- Produces 32-bit output (accumulated inner product) per row
 
 **Generic Parameters:**
 - `WEIGHT_TDATA_WIDTH`: 128
 - `OUTPUT_TDATA_WIDTH`: 32
 - `BRAM_ADDR_WIDTH`: 12
 
-**State Machine:**
+**State Machine (Current Refactored Version):**
 ```
 idle → active → finishing → done
   │      ↓ (blocked if needed)      ↓
-  └─ blocked → active          blocked_finishing → done
+  └─ blocked → active          blocked_finishing → finishing
 ```
 
 | State | Behavior |
 |-------|----------|
 | `idle` | Waiting for first weight beat (`s00_axis_tvalid`). On valid → `active`. |
-| `active` | Accepting weight beats, performing MAC each cycle `tvalid='1'`. On `tlast` → `finishing`. On `result_ready='1'` at `count=1` → `blocked`. |
-| `finishing` | `tlast` received. Runs a 2-cycle pipeline flush (keeping `macc_en='1'` to drain the MAC stages), then executes the 2-stage summation tree over 2 registered cycles. Moves to `done` or `blocked_finishing` based on `m00_axis_tready`. |
-| `blocked` | Weight reception paused because a prior result has not been consumed by downstream. Resumes to `active` when `m00_axis_tready='1'`. |
-| `blocked_finishing` | Summation complete but downstream not ready. Waits for `m00_axis_tready` → `done`. |
-| `done` | Result valid. Asserts `m00_axis_tvalid` and `m00_axis_tlast`. Resets `flush_count`, `sum_done`. On `m00_axis_tready` → `idle`. |
+| `active` | Accepting weight beats. On each beat with `s00_axis_tvalid='1'`, run MAC and increment `count`. On `tlast` → `finishing`. On `count=2 and first_done='1'` → fire result, stay in active or go to blocked. On `count=1 and result_ready='1'` → `blocked`. |
+| `finishing` | `tlast` received. Continue MAC pipeline with `macc_en='1'`. At `count=2 and first_done='1'`, fire result and transition to `done`. ⚠️ **CRITICAL BUG:** After final weight beat with no more beats arriving, pipeline drains incorrectly; final row's result may not fire. |
+| `blocked` | Weight reception paused because result not consumed. Resume to `active` when `m00_axis_tready='1'`. |
+| `blocked_finishing` | In `finishing` state with result pending; downstream not ready. Resume to `finishing` (not `done`) when ready. |
+| `done` | Result valid. Asserts `m00_axis_tlast`. On `m00_axis_tready` → `idle`. |
 
-**MAC Pipeline:**
+**MAC Pipeline & Result Generation:**
 - 16 DSP units compute: `acc_out_i = Σ(weight_byte[i] * activation_byte[i])` for each byte lane
 - Each DSP is 8×8→32-bit multiply-accumulate with synchronous load
-- The `macc_dsp` component has a **2-stage internal pipeline**: inputs are registered one cycle before multiply, and the multiply result feeds the adder the same cycle — so valid data presented at cycle K appears in `adder_out` (and thus `accum_out`) at cycle **K+2**.
-- Results are reduced through a **2-stage registered adder tree** after the flush:
-  - **Stage 1:** 8 pairwise additions (16→8 partial sums), registered
-  - **Stage 2:** 4 additions + final 4→1 combinatorial chain produces `output_reg` (32-bit)
+- **2-stage internal pipeline:** Valid data at cycle K appears in accumulators at cycle K+2
+- **Result Firing:** At `count=2 and first_done='1'`, compute `output_reg = acc_out1 + ... + acc_out16` (16-way combinatorial sum)
+- **Count-Based Trigger:** For 768-element vector, `length_div16=48`, so results fire every 48 beats
+- ⚠️ **Architectural Limitation:** Assumes the next row's first beats (count=0,1) provide the 2-cycle pipeline drain for the current row. This breaks for the final row in a single-packet DMA transfer where no further beats arrive.
 
-**Pipeline Flush Mechanism (`flush_count`):**
-
-Because the MAC has a 2-stage internal pipeline, simply deasserting `macc_en` the cycle after `tlast` is accepted would leave the last product in-flight and not yet reflected in `adder_out`. The `flush_count` signal (2-bit) solves this:
-
-1. On entry to `finishing`, `flush_count=0` and `macc_en='1'` (driven by `flush_count < 2`).
-2. `tdata` and `bram_din` are held at their last-beat values (AXI-Stream initiator deasserts `tvalid` but the data bus is still driven).
-3. Over 2 rising edges, `flush_count` increments to 2 and the last product propagates through all MAC pipeline stages.
-4. When `flush_count = 2`, `macc_en='0'`; accumulators are frozen and stable. The summation tree then reads them.
-
-**`clr_acc` Guard:**
-
-The accumulator clear signal is gated to fire **only in `idle` or `done`** states:
-```vhdl
-clr_acc <= '1' when count = 0 and (state = idle or state = done) else '0';
-```
-Without this guard, `clr_acc` would fire in `finishing` when `macc_en='0'` and `count=0` — wiping the accumulators just as the summation tree is reading them.
-
-**Key Signals:**
-- `length_div16`: `length(15 downto 4)` — number of 128-bit BRAM words (and weight beats) per dot product
-- `count`: Tracks current BRAM word index (0 to `length_div16-1`)
-- `flush_count`: 2-bit counter; drives 2 extra `macc_en` cycles in `finishing` to drain MAC pipeline
-- `sum_valid`: Handshake flag between Stage 1 and Stage 2 of the adder tree
-- `sum_done`: Prevents the adder tree from re-executing if `finishing` lingers
-- `first_done`: Set when `count = length_div16 - 1`; confirms all accumulations are complete
-- `bram_addr`: Directly driven from `count` (not `next_count`) — BRAM presents data one cycle after address, matching the MAC input registration stage
-- `s00_axis_tready`: High only in `active` state
-- `m00_axis_tvalid`: Combinatorially driven by `result_ready` register
+**Signal Definitions:**
+- `length_div16`: `length(15 downto 4)` — number of 128-bit BRAM words per row
+- `count`: Current BRAM word index (0 to `length_div16-1`), wraps after `length_div16-1`
+- `first_done`: Set when `count = length_div16 - 1`; persists through all rows until `done` state
+- `clr_acc`: Asserted on `count<2 and first_done='0'` or `count=1 and first_done='1'` during active cycles to reset accumulators
+- `bram_addr`: Driven by `next_count` (prefetch one cycle early; BRAM has 1-cycle latency)
+- `result_ready`: High when result is valid; cleared after handshake
+- `m00_axis_tvalid`: Directly driven by `result_ready`
+- `m00_axis_tlast`: Asserted when `state=done`
 
 ---
 
@@ -365,81 +345,152 @@ out = mdriver.matmul(activations, weights, output_buffer)
 
 ## Bug History & Design Decisions
 
-This section records bugs found during simulation and the reasoning behind their fixes. It exists to prevent regressions and to explain non-obvious design choices.
+This section records bugs found during simulation and implementation, and the architectural approaches taken to fix them.
 
-### Bug 1 — Summation tree unreachable for short vectors (`count = 2` trigger)
+### Original Bugs (Early Simulation)
+
+#### Bug 1 — Summation tree unreachable for short vectors (`count = 2` trigger)
 
 **Symptom:** Accumulators populated correctly but `m00_axis_tvalid` never asserts for `length_div16 ≤ 2`.
 
-**Root Cause:** The original Stage 1 condition was `count = 2 and first_done = '1'`. `next_count` wraps to 0 at `count = length_div16 - 1`. For `length_div16 = 1`, count wraps back to 0 immediately on the `tlast` beat and never reaches 2. For `length_div16 = 2`, count oscillates 0↔1, also never reaching 2.
+**Root Cause:** The original Stage 1 condition was `count = 2 and first_done = '1'`. `next_count` wraps to 0 at `count = length_div16 - 1`. For `length_div16 = 1`, count wraps back to 0 immediately on the `tlast` beat and never reaches 2.
 
-**Fix:** Replaced the `count = 2` trigger with a dedicated `flush_count` / `sum_done` flow tied to entry into `finishing`, making the summation tree independent of vector length.
-
----
-
-### Bug 2 — `macc_en='1'` throughout `finishing` caused accumulator corruption
-
-**Symptom:** Accumulators correct after the `active` phase but wrong by the time the sum tree reads them; value increases with simulation time.
-
-**Root Cause:** The original `macc_en` was `'1'` whenever `state = finishing`. Since `count` wraps to 0 and BRAM address 0 is re-fetched every cycle, the MAC units kept accumulating the first activation word repeatedly for an unbounded number of cycles before `count` happened to reach 2.
-
-**Fix (first attempt):** Removed `finishing` from `macc_en`. Accumulators froze correctly, but `acc_out` was always 0 — because the MAC has a 2-stage pipeline and the last product had not yet propagated into `adder_out` when the sum tree read it.
-
-**Fix (final):** Restore `macc_en='1'` in `finishing` for exactly `flush_count < 2` cycles. `flush_count` resets to 0 in `done`, preventing re-entry.
+**Initial Fix:** Implemented a dedicated `flush_count` / `sum_done` flow and 2-stage registered summation tree tied to `finishing` state entry, making result generation independent of vector length.
 
 ---
 
-### Bug 3 — `clr_acc` fires in `finishing` and wipes accumulators
+#### Bug 2 — `macc_en='1'` throughout `finishing` caused accumulator corruption
 
-**Symptom:** Even with the flush properly gated, accumulators briefly read as 0 in waveforms between flush completion and sum tree Stage 1.
+**Symptom:** Accumulators correct after `active` phase but corrupted by `finishing`; value drifts with simulation time.
 
-**Root Cause:** Original condition: `clr_acc <= '1' when count = 0 and macc_en = '0'`. In `finishing`, after `flush_count = 2`, `macc_en` drops to `'0'` and `count = 0` (it wrapped on the last active beat). Both conditions true → `clr_acc='1'` → accumulators zeroed one cycle before Stage 1.
+**Root Cause:** `macc_en='1'` in `finishing` allowed unbounded accumulation of BRAM[0] as `count` wrapped repeatedly.
 
-**Fix:** Gate `clr_acc` to only fire in `idle` or `done`:
-```vhdl
-clr_acc <= '1' when count = 0 and (state = idle or state = done) else '0';
-```
+**Initial Fix:** Introduced `flush_count` (2-bit) to limit `macc_en='1'` to exactly 2 cycles in `finishing` for MAC pipeline drainage.
 
 ---
 
-### Bug 4 — Testbench AXI-Stream handshake missed the beat
+#### Bug 3 — `clr_acc` fires in `finishing` and wipes accumulators
 
-**Symptom:** With a correct manager, `macc_en` never fires — accumulators stay at 0 throughout simulation.
+**Symptom:** Accumulators read as 0 between flush completion and sum tree read.
 
-**Root Cause:** The original TB pattern:
-```vhdl
-wait until rising_edge(clk);     -- burns one cycle unconditionally
-while s00_axis_tready /= '1' loop
-    wait until rising_edge(clk);
-end loop;
-```
-At the first `wait`, the manager's `idle→active` transition was registered. `tready` went high as a post-delta update on that same edge. The `while` condition was evaluated in simulation time, saw `tready='1'` immediately, and exited — but the TB then deasserted `tvalid` before the next rising edge. So on the first cycle `tready='1'`, `tvalid` was already `'0'`.
+**Root Cause:** `clr_acc='1'` when `count=0 and macc_en='0'` fired in `finishing` after flush ended, zeroing accumulators before summation.
 
-**Fix:** Replace with a `loop / exit when` that waits for a rising edge *and* samples `tready` atomically:
-```vhdl
-loop
-    wait until rising_edge(clk);
-    exit when s00_axis_tready = '1';
-end loop;
-```
+**Fix:** Gated `clr_acc` to only fire in `idle` or `done` states.
+
+---
+
+#### Bug 4 — Testbench AXI-Stream handshake missed the beat
+
+**Symptom:** `macc_en` never fires in simulation; accumulators stay 0.
+
+**Root Cause:** AXI-Stream TB pattern burned a cycle before checking `tready`, causing `tvalid` to deassert before handshake.
+
+**Fix:** Changed to `loop / exit when` pattern that waits and samples atomically.
+
+---
+
+### Architectural Refactoring & The Critical Bug
+
+#### Refactoring Attempt (Session N)
+
+**Motivation:** The flush_count / 2-stage sum tree architecture was adding complexity. Hypothesis: the 32-bit manager (known to work) uses a simpler model.
+
+**Changes Made:**
+- Removed `flush_count`, `sum_valid`, `sum_done`, `sum_stage1_x` signals
+- Removed 2-stage registered summation tree
+- Changed to `active | finishing` combined state with direct 16-accumulator sum at `count=2 and first_done='1'`
+- Simplified `clr_acc` logic: `(count < 2 and first_done='0') or (count=1 and first_done='1')`
+- Changed `clr_acc` guard to fire during active computation, not just `idle`/`done`
+- Fixed `bram_addr <= next_count` (prefetch)
+- Fixed `blocked_finishing` to return to `finishing` (not `done`)
+
+**Result:** Code complexity reduced by ~50 lines. Architecture now mirrors 32-bit exactly.
+
+**Expected Behavior:** Manager should fire results continuously: every `length_div16` beats (every 48 beats for 768-dim), regardless of `tlast`. One `tlast` at the end marks final row. All 3072 output indices populated.
+
+---
+
+#### Critical Bug Exposed: Only First Output Index Populated ⚠️
+
+**Symptom (from cdma_test.py):** DMA transfer of full 3072×768 matrix produces only `out_buf[0]` with valid value; rest are 0.
+
+**Root Cause (ARCHITECTURAL FLAW):**
+
+The refactored architecture assumes the pipeline will drain naturally via "free" flush cycles provided by the next row's beats. But this breaks for the **final row** with a single-packet DMA transfer:
+
+1. **DMA Packet Structure:** Python driver sends entire weight matrix as ONE AXI-Stream packet:
+   - Total beats: 3072 rows × 48 beats/row = 147,456 beats
+   - Only the **final beat (beat 147455)** asserts `tlast='1'`
+   - This beat is `count=47` (last beat) of row 3071
+
+2. **Result Fire Condition:** Manager fires results at `count=2 and first_done='1'`
+   - For row 3071: Beats 147408-147455 (its 48 beats)
+   - At beat 147455: `count=47`, `tlast='1'` → state transitions to `finishing`
+   - Expected next beat: count wraps to 0, then to 1, then to 2 (at beat 147457)
+   - **Actual next beat:** There is none. The DMA transfer ends.
+
+3. **Pipeline Never Drains for Final Row:**
+   - After beat 147455, `s00_axis_tvalid='0'` (no more weight beats)
+   - Manager is in `finishing` state with `macc_en='1'` (independent of `tvalid`)
+   - But the MACs compute using old (stale) `s00_axis_tdata` and `bram_din` — wrong behavior
+   - The 2-stage MAC pipeline for row 3071 never properly flushes into accumulators
+   - Result for row 3071 never fires at `count=2`
+
+4. **Result:** Only rows 0 through ~1.04 produce valid outputs (~52 out of 3072). DMA captures first result only; remaining 3071 are never sent, leaving `out_buf[1..3071]` as zeros.
+
+---
+
+#### Why the 32-bit Manager May Not Have Exposed This Bug
+
+- The 32-bit uses 96 beats/row (768/8). Smaller beat count may interact differently with DMA buffering.
+- The 32-bit test vector may use shorter matrices where the final row's pipeline doesn't need extra beats.
+- The bug may exist in the 32-bit too but was masked by test configuration.
+
+---
+
+#### Required Solution: Explicit `tlast` Handling
+
+**Correct approach:** Do NOT rely on implicit count wrapping to drain the final row's pipeline. Instead:
+
+1. **Detect `tlast`:** Track when the final weight beat arrives.
+2. **Explicit Flush:** After the current row cycle, run exactly 2 cycles with `macc_en='1'` even if `s00_axis_tvalid='0'`, to drain the MAC pipeline.
+3. **Fire Result:** At `count=2` (after those 2 cycles), output the final result and assert `m00_axis_tlast='1'`.
+4. **End Transfer:** Transition to `done`.
+
+This reintroduces a cycle counter similar to `flush_count`, but now it is **mandatory for correctness** with single-packet DMA transfers, not an optional optimization.
+
+**Recommended Fix:** Restore a version of the `flush_count` mechanism, but with explicit `tlast` awareness and gating to prevent over-firing.
 
 ---
 
 ## Known Issues & Future Improvements
 
-### Current Issues
+### CRITICAL: Architectural Flaw in Current Refactored Implementation
 
-1. **Summation tree is 2-stage, not 4-stage:**
-   - The current implementation uses 2 registered stages followed by a combinatorial chain in Stage 2. For `OUTPUT_TDATA_WIDTH=32`, overflow is possible if all 16 accumulators are near INT32_MAX. Consider widening `SUM_OUTPUT` or saturating.
+**Status:** ⚠️ **NOT WORKING** — Only first output index populated in multi-neuron transfers
 
-2. **`sum_done` not reset on `blocked_finishing → done` path:**
-   - `sum_done` is reset in `done`, but `flush_count` and `sum_done` are only reset inside the `done` case. If `blocked_finishing` transitions directly to `done` and then immediately to `idle` within one `m00_axis_tready` pulse, there is no issue — but this is worth verifying in waveforms with back-to-back neuron requests.
+**Issue:** The refactored architecture (count-based firing without explicit `tlast` handling) assumes the next row provides 2 flush cycles for the current row's pipeline. This is violated for the **final row** in a single-packet DMA transfer.
 
-3. **AXI4-Lite Strobe Width Mismatch** (TestBench_process.vhd):
+**Evidence:** `cdma_test.py` output shows only `out_buf[0]` populated; all other indices are 0.
+
+**Immediate Action Required:**
+- **Do NOT synthesize the current matmul_manager_128bit.vhd** — it will fail multi-neuron workloads.
+- Restore the `flush_count` mechanism with explicit `tlast` awareness to handle final row pipeline draining correctly.
+- Or restructure to support per-row packet boundaries (requires Python driver changes).
+
+**Pending Issues (from pre-refactoring):**
+
+1. **Output width overflow potential:**
+   - Direct 16-accumulator sum can produce values wider than 32 bits if individual accumulators are large
+   - Current code uses `resize(..., SUM_OUTPUT)` which truncates to 32 bits
+   - May cause saturation/truncation of large dot products
+   - **Mitigation:** For int8 inputs, 16 MACs of (8×8=64-bit products) sum to ~14 bits per MAC, total ~18 bits per row. Within 32-bit range for typical workloads.
+
+2. **AXI4-Lite Strobe Width Mismatch** (TestBench_process.vhd):
    - Signal `s00_axi_wstrb` should be `std_logic_vector(3 downto 0)` for 32-bit data
    - **Fix:** Change to `s00_axi_wstrb : std_logic_vector(3 downto 0)`
 
-4. **Empty matmul_test.py**:
+3. **Empty matmul_test.py**:
    - Test file created but not populated with unit tests
    - **Fix:** Implement basic test vectors for DSP unit verification
 

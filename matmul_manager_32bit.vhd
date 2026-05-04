@@ -135,9 +135,10 @@ m00_axis_tvalid <= result_ready;
 m00_axis_tdata <= output_reg;
 m00_axis_tlast <= '1' when state = done else '0';
 next_count <= (others => '0') when (state = idle or state = done or count = length_div4-1) else count + 1;
--- 0000 0000 1111 0000 -> 0000 0000 0011 1100
 bram_en <= '1' when (state = idle or s00_axis_tvalid = '1') else '0';
-bram_addr <= std_logic_vector(resize(next_count, BRAM_ADDR_WIDTH));
+-- BRAM address steps through consecutive rows: row_addr * length_div4 + count
+-- This ensures each computation reads all its activation data sequentially
+bram_addr <= std_logic_vector(resize(row_addr * resize(length_div4, BRAM_ADDR_WIDTH) + resize(count, BRAM_ADDR_WIDTH), BRAM_ADDR_WIDTH));
 
 process (s00_axis_aclk)
 begin

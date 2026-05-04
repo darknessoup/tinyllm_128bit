@@ -115,7 +115,7 @@ architecture arch_imp of matmul_v1_0 is
   component matmul_manager is
     generic (
       WEIGHT_TDATA_WIDTH	: integer	:= 128;
-      OUTPUT_TDATA_WIDTH	: integer	:= 31;
+      OUTPUT_TDATA_WIDTH	: integer	:= 32;
       BRAM_ADDR_WIDTH	: integer	:= 11
     );
     Port (

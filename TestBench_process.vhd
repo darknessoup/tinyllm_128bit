@@ -8,10 +8,10 @@
 --
 --   Test vectors:
 --     Activations (BRAM addr 0): 16x [1,1,1,...,1] = 0x01010101010101010101010101010101
---     Weights (AXI-Stream beat):  [1,2,3,...,16] = 0x0102030405060708090a0b0c0d0e0f10
---     vec_len = 16  =>  length_div16 = 1
+--     Weights (AXI-Stream beats): [1,2,3,...,16] per beat, 2 beats total
+--     vec_len = 32  =>  length_div16 = 2 (two 16-element chunks)
 --
---   Expected result: sum(i * 1, i=1..16) = 1+2+3+...+16 = 136 = 0x88
+--   Expected result: sum(i * 1, i=1..16) * 2 beats = 272 = 0x0110
 --   Observe on waveform: m00_axis_tdata = 0x0000000000000088 when tvalid rises.
 --
 --   Key signals to probe
@@ -105,6 +105,10 @@ signal ena, rsta               : std_logic;
 signal wea : std_logic_vector(15 downto 0) := (others => '0');
 signal web : std_logic_vector(15 downto 0) := (others => '0');
 signal addra : std_logic_vector(11 downto 0);
+signal addrb : std_logic_vector(31 downto 0) := (others => '0');
+signal dinb  : std_logic_vector(127 downto 0) := (others => '0');
+signal doutb : std_logic_vector(127 downto 0);  -- PORT B output for diagnostics
+signal rsta_busy, rstb_busy : std_logic;
 
 signal s00_axi_wdata  : std_logic_vector(31 downto 0);
 signal douta, dina    : std_logic_vector(127 downto 0);
@@ -137,10 +141,9 @@ blk_mem_inst : blk_mem_dp_32_1024
     clkb  => clk,
     enb   => '1',
     web   => web,
-    addrb => (others => '0'),
-    -- Activation bytes: 16x [1] = 0x01010101010101010101010101010101
-    dinb  => x"01010101010101010101010101010101",
-    doutb => open
+    addrb  => addrb,
+    dinb  => dinb,
+    doutb => doutb
   );
 
 inst_matmul_v1_0 : matmul_0
@@ -212,40 +215,82 @@ end procedure;
 
 begin
     -- Step 1: Assert reset and write activations into BRAM port B.
-    -- web=x"FFFF" commits dinb (bytes 0x00..0x0F) to address 0 during reset
-    -- so the data is stable before the manager pre-fetches address 0 on release.
+    -- For vec_len=32 (length_div16=2), manager expects 2 BRAM addresses per computation.
+    -- Computation 1 (row_addr=0): reads addresses 0,1 (all 1's)
+    -- Computation 2 (row_addr=1): reads addresses 2,3 (all 2's)
     resetn <= '0';
+    
+    -- Force PORT A enable during writes so we can verify BRAM data
+    -- (Normally ena is controlled by manager, but during init it may be 0)
+    -- We need to manually strobe PORT A to verify writes committed
+    
+    -- Write TEST 1 activations (0x010101) to addresses 0, 1
+    addrb  <= (others => '0');
+    dinb   <= x"01010101010101010101010101010101";
     web    <= x"FFFF";
     wait for clk_period * 2;
+    
+    addrb  <= x"00000001";
+    dinb   <= x"01010101010101010101010101010101";
+    wait for clk_period * 2;
+    
+    -- Write TEST 2 activations (0x020202) to addresses 2, 3
+    addrb  <= x"00000002";
+    dinb   <= x"02020202020202020202020202020202";
+    wait for clk_period * 2;
+    
+    addrb  <= x"00000003";
+    dinb   <= x"02020202020202020202020202020202";
+    wait for clk_period * 2;
+    
     web    <= x"0000";
+
+    -- Step 1b: Verification - ensure BRAM writes completed
+    -- (Watch doutb signal on waveform - should show the values you wrote)
+    wait for clk_period;
+    -- At this point:
+    -- - addrb = 0x00000003, doutb should show 0x02020202... (last value written)
+    -- - If doutb shows 0x00000000, BRAM writes may not have worked
+    wait for clk_period * 3;
 
     -- Step 2: Release reset, allow AXI slave to initialise.
     resetn <= '1';
+    addrb  <= (others => '0');
     wait for 40 ns;
 
-    -- Step 3: Write vec_len = 16 via AXI4-Lite.
-    -- length_div16 = 16/16 = 1: manager expects exactly one BRAM word and one
-    -- weight beat before it produces a result.
-    write_axi(0, std_logic_vector(to_unsigned(16, 32)));
+    -- Step 3: Write vec_len = 32 via AXI4-Lite (two 16-element chunks).
+    -- length_div16 = 32/16 = 2: manager expects two BRAM words per computation.
+    write_axi(0, std_logic_vector(to_unsigned(32, 32)));
     wait for 20 ns;
 
-    -- Step 4: Assert downstream ready so the result is consumed immediately.
+    -- Step 4: Assert downstream ready so results are consumed immediately.
     m00_axis_tready <= '1';
     wait until rising_edge(clk);
 
-    -- Step 5: Send ONE 128-bit weight beat with weights [1..16], tlast asserted.
-    -- Weights: 0x0102030405060708090a0b0c0d0e0f10
-    -- Activations: 0x01010101010101010101010101010101 (all 1's)
-    -- MAC: sum(i * 1, i=1..16) = 1+2+3+...+16 = 136 = 0x88
+    -- ========================================================================
+    -- TEST 1: FIRST computation with BRAM addr 0 (0x010101 activations)
+    -- ========================================================================
+    -- Step 5: Send TWO 128-bit weight beats (tlast=0, then tlast=1).
+    -- Beat 1: Weights [1,2,3,...,16] with tlast=0 (more data coming)
+    -- Beat 2: Weights [1,2,3,...,16] with tlast=1 (last beat, computation complete)
+    -- Activations (BRAM addr 0): 0x01010101... (all 1's)
+    -- Expected: sum(i * 1, i=1..32) = (1+2+...+16) * 2 = 272 = 0x0110
+    
+    -- Beat 1 (not last)
     s00_axis_tdata  <= x"0102030405060708090a0b0c0d0e0f10";
     s00_axis_tstrb  <= x"FFFF";
     s00_axis_tvalid <= '1';
-    s00_axis_tlast  <= '1';
-    -- Proper AXI-Stream handshake: keep tvalid asserted until tready is seen
-    -- HIGH at a rising edge (i.e., the beat is actually consumed that cycle).
-    -- The old pattern burned one cycle with an unconditional wait, then exited
-    -- the loop post-delta when tready had gone high but the handshake edge had
-    -- already passed -- leaving tvalid='0' on the first active cycle.
+    s00_axis_tlast  <= '0';  -- More beats follow
+    loop
+        wait until rising_edge(clk);
+        exit when s00_axis_tready = '1';
+    end loop;
+    
+    -- Beat 2 (last)
+    s00_axis_tdata  <= x"0102030405060708090a0b0c0d0e0f10";
+    s00_axis_tstrb  <= x"FFFF";
+    s00_axis_tvalid <= '1';
+    s00_axis_tlast  <= '1';  -- Last beat
     loop
         wait until rising_edge(clk);
         exit when s00_axis_tready = '1';
@@ -253,11 +298,44 @@ begin
     s00_axis_tvalid <= '0';
     s00_axis_tlast  <= '0';
 
-    -- Step 6: Wait for m00_axis_tvalid.
-    -- m00_axis_tdata should equal 0x0000000000000088 (136 decimal).
-    -- The pipeline in matmul_manager adds latency between the weight beat being
-    -- accepted and tvalid rising.
-    wait for 50 ns;  -- keep result visible in waveform
+    -- Step 6: Wait for first result to appear.
+    wait until m00_axis_tvalid = '1';
+    wait for 30 ns;  -- Hold result on waveform
+    
+    -- Step 7: Wait for manager to return to idle (result_ready clears).
+    wait until m00_axis_tvalid = '0';
+    wait for 50 ns;  -- Extra settle time
+
+    -- ========================================================================
+    -- TEST 2: SECOND computation with BRAM addr 1 (0x020202 activations)
+    -- ========================================================================
+    -- Step 8: Send TWO 128-bit weight beats (tlast=0, then tlast=1).
+    -- Beat 1: Weights [1,2,3,...,16] with tlast=0 (more data coming)
+    -- Beat 2: Weights [1,2,3,...,16] with tlast=1 (last beat, computation complete)
+    -- Activations (BRAM addr 1): 0x02020202... (all 2's)
+    -- Expected: sum(i * 2, i=1..32) = (1+2+...+16) * 2 * 2 = 544 = 0x0220
+    
+    -- Beat 1 (not last)
+    s00_axis_tdata  <= x"0102030405060708090a0b0c0d0e0f10";
+    s00_axis_tstrb  <= x"FFFF";
+    s00_axis_tvalid <= '1';
+    s00_axis_tlast  <= '0';  -- More beats follow
+    loop
+        wait until rising_edge(clk);
+        exit when s00_axis_tready = '1';
+    end loop;
+    
+    -- Beat 2 (last)
+    s00_axis_tdata  <= x"0102030405060708090a0b0c0d0e0f10";
+    s00_axis_tstrb  <= x"FFFF";
+    s00_axis_tvalid <= '1';
+    s00_axis_tlast  <= '1';  -- Last beat
+    loop
+        wait until rising_edge(clk);
+        exit when s00_axis_tready = '1';
+    end loop;
+    s00_axis_tvalid <= '0';
+    s00_axis_tlast  <= '0';
 
     wait;
 end process;
